@@ -95,5 +95,4 @@ def main():
     writer.saveAsTable(OUTPUT_TABLE_DIM_LOCATION)
 
 
-if __name__ == "__main__":
-    main()
+main()

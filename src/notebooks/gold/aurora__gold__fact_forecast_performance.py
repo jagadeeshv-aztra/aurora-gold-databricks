@@ -211,5 +211,4 @@ def main():
     out_df.write.format(WRITE_FORMAT).mode(WRITE_MODE).saveAsTable(OUTPUT_TABLE_FACT_FORECAST_PERFORMANCE)
 
 
-if __name__ == "__main__":
-    main()
+main()

@@ -86,5 +86,4 @@ def main():
     sku_weights.write.format(WRITE_FORMAT).mode(WRITE_MODE).saveAsTable(OUTPUT_TABLE_SKU_WEIGHTS)
 
 
-if __name__ == "__main__":
-    main()
+main()

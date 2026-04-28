@@ -154,5 +154,4 @@ def main():
     writer.saveAsTable(OUTPUT_TABLE_FACT_DEMAND_HISTORY)
 
 
-if __name__ == "__main__":
-    main()
+main()

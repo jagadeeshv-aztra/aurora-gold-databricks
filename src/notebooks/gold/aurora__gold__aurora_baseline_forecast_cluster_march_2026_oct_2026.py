@@ -607,5 +607,4 @@ def main():
             write_sku_forecast(cluster_forecast_df=cluster_forecast_df, sku_weights_df=sku_weights_df)
 
 
-if __name__ == "__main__":
-    main()
+main()

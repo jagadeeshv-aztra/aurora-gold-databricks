@@ -128,5 +128,4 @@ def main():
     fact_supply_coverage.write.format(WRITE_FORMAT).mode(WRITE_MODE).saveAsTable(OUTPUT_TABLE_FACT_SUPPLY_COVERAGE)
 
 
-if __name__ == "__main__":
-    main()
+main()
