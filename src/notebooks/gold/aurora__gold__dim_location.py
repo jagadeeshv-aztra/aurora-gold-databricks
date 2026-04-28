@@ -1,4 +1,5 @@
 # Databricks notebook source
+# COMMAND ----------
 # MAGIC %md
 # MAGIC <h3>Databricks tables used</h3>
 # MAGIC <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse; width:100%">
