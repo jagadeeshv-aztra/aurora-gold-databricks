@@ -1,12 +1,65 @@
 # Databricks notebook source
-# MAGIC %md 
-# MAGIC - **aurora.gold.aurora_baseline_forecast_cluster_march_2026_oct_2026** is formed using below table and model:
-# MAGIC - aurora.silver.aurora_filtered_sales_actuals_2023_2026
-# MAGIC - data trained using model : aurora.gold.baseline_forecast_model
+# MAGIC %md
+# MAGIC <h3>Databricks tables used</h3>
+# MAGIC <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse; width:100%">
+# MAGIC   <thead>
+# MAGIC     <tr>
+# MAGIC       <th align="left">Table / Model</th>
+# MAGIC       <th align="left">Role</th>
+# MAGIC       <th align="left">How it’s used</th>
+# MAGIC     </tr>
+# MAGIC   </thead>
+# MAGIC   <tbody>
+# MAGIC     <tr>
+# MAGIC       <td><code>aurora.silver.aurora_filtered_sales_actuals_2023_2026</code></td>
+# MAGIC       <td>INPUT</td>
+# MAGIC       <td>Cluster-level weekly sales history used for training</td>
+# MAGIC     </tr>
+# MAGIC     <tr>
+# MAGIC       <td><code>aurora.gold.aurora_baseline_forecast_cluster_march_2026_oct_2026</code></td>
+# MAGIC       <td>OUTPUT</td>
+# MAGIC       <td>Cluster-level baseline forecast (weekly)</td>
+# MAGIC     </tr>
+# MAGIC     <tr>
+# MAGIC       <td><code>aurora.gold.aurora_sku_weights_lookup_table</code></td>
+# MAGIC       <td>OUTPUT (optional)</td>
+# MAGIC       <td>SKU weights lookup (can be produced here, but recommended via its dedicated notebook)</td>
+# MAGIC     </tr>
+# MAGIC     <tr>
+# MAGIC       <td><code>aurora.default.aurora_sku_forecast_march_2026_oct_2026</code></td>
+# MAGIC       <td>OUTPUT (optional)</td>
+# MAGIC       <td>SKU-level forecast derived from cluster forecast x sku weights</td>
+# MAGIC     </tr>
+# MAGIC     <tr>
+# MAGIC       <td><code>aurora.gold.baseline_forecast_model</code></td>
+# MAGIC       <td>MODEL</td>
+# MAGIC       <td>MLflow registered model name used for training/serving</td>
+# MAGIC     </tr>
+# MAGIC   </tbody>
+# MAGIC </table>
 
 # COMMAND ----------
 
-# MAGIC %pip install statsforecast hierarchicalforecast
+INPUT_TABLE_SALES_ACTUALS = "aurora.silver.aurora_filtered_sales_actuals_2023_2026"
+
+OUTPUT_TABLE_CLUSTER_FORECAST = "aurora.gold.aurora_baseline_forecast_cluster_march_2026_oct_2026"
+OUTPUT_TABLE_SKU_WEIGHTS = "aurora.gold.aurora_sku_weights_lookup_table"
+OUTPUT_TABLE_SKU_FORECAST = "aurora.default.aurora_sku_forecast_march_2026_oct_2026"
+
+MLFLOW_MODEL_NAME = "aurora.gold.baseline_forecast_model"
+
+# Important variables / knobs
+TRAIN_END_DATE_INCLUSIVE = "2026-03-22"
+FORECAST_HORIZON_WEEKS = 30
+
+# Whether to register/update the MLflow model (requires MLflow registry permissions)
+LOG_AND_REGISTER_MODEL = True
+
+# Optional downstream outputs (usually run via dedicated notebooks/jobs)
+WRITE_SKU_WEIGHTS = False
+WRITE_SKU_FORECAST = False
+
+WRITE_MODE = "overwrite"
 
 # COMMAND ----------
 
@@ -461,235 +514,98 @@ class BaselineForecast:
 
 # COMMAND ----------
 
-import pyspark.sql.functions as F
-
-input_df = spark.table("aurora.silver.aurora_filtered_sales_actuals_2023_2026").filter(F.col("next_sunday") <= '2026-03-22')
-
-display(input_df)
-
-# COMMAND ----------
-
-train_df = (
-    input_df
-    .groupBy("store", "department_code", "cluster_code", "next_sunday")
-    .agg(
-        F.sum(F.col("sales_quantity")).alias("sales_quantity")
-    )
-)
-
-display(train_df)
-
-# COMMAND ----------
-
-train_df.select(
-    F.min("next_sunday"),
-    F.max("next_sunday")
-).show()
-
-# COMMAND ----------
-
-df_train = train_df.toPandas()
-
-for col in ["store", "department_code", "cluster_code"]:
-    df_train[col] = df_train[col].astype(str)
-
-# COMMAND ----------
-
-bf = BaselineForecast(df_train, model_name="aurora.gold.baseline_forecast_model")
-bf.fit()
-
-# COMMAND ----------
-
-df_forecast = bf.predict()
-
-# COMMAND ----------
-
-forecast_df = spark.createDataFrame(df_forecast)
-
-display(forecast_df)
-
-# COMMAND ----------
-
-display(
-    forecast_df.agg(
-        F.min("weekstartdate").alias("min_forecast_date"),
-        F.max("weekstartdate").alias("max_forecast_date")
-    )
-)
-
-# COMMAND ----------
-
-forecast_df.write.mode("overwrite").saveAsTable("aurora.gold.aurora_baseline_forecast_cluster_march_2026_oct_2026")
-print("✅ Done")
-
-# COMMAND ----------
-
-matching_depts = forecast_df.groupBy("department_code").agg(F.countDistinct("store").alias("store_count")).filter(F.col("store_count") == forecast_df.select("store").distinct().count())
-forecast_df_filtered = forecast_df.join(matching_depts.select("department_code"), on="department_code", how="inner")
-
-display(forecast_df_filtered)
-
-# COMMAND ----------
-
-base_fcst_df = forecast_df.select(
-    "store",
-    "department_code",
-    "cluster_code",
-    F.to_date(F.col("weekstartdate")).alias("next_sunday"),
-    "forecast_qty"
-)
-
-display(base_fcst_df)
-
-# COMMAND ----------
-
-display(
-    base_fcst_df.agg(
-        F.min("next_sunday").alias("min_forecast_date"),
-        F.max("next_sunday").alias("max_forecast_date")
-    )
-)
-
-# COMMAND ----------
-
-import pyspark.sql.functions as F
-
-actuals_df = spark.table("aurora.silver.aurora_filtered_sales_actuals_2023_2026")
-
-print(actuals_df.count())
-display(actuals_df)
-
-# COMMAND ----------
-
-cluster_actuals = (
-    actuals_df                                       
-    .groupBy("store", "department_code", "cluster_code", "next_sunday")
-    .agg(F.sum("sales_quantity").alias("cluster_actual_qty"))
-)
-
-display(cluster_actuals)
-
-# COMMAND ----------
-
-sku_weights = (
-    actuals_df
-    .groupBy("store", "department_code", "cluster_code", "sku_code")
-    .agg(F.sum("sales_quantity").alias("sku_total_sales"))
-)
-
-display(sku_weights)
-
-# COMMAND ----------
-
-cluster_totals = (
-    sku_weights
-    .groupBy("store", "department_code", "cluster_code")
-    .agg(F.sum("sku_total_sales").alias("cluster_total_sales"))
-)
-
-display(cluster_totals)
-
-# COMMAND ----------
-
-import pyspark.sql.functions as F
 from pyspark.sql.window import Window
-from pyspark.sql.types import IntegerType
 
-sku_weights = (
-    sku_weights
-    .join(cluster_totals, on=["store", "department_code", "cluster_code"], how="left")
-    .withColumn(
-        "sku_weight",
-        F.when(
-            F.col("cluster_total_sales") > 0,
-            F.col("sku_total_sales") / F.col("cluster_total_sales")
-        ).otherwise(F.lit(0.0))
+
+def prepare_training_data(actuals_df):
+    input_df = actuals_df.filter(F.col("next_sunday") <= F.lit(TRAIN_END_DATE_INCLUSIVE))
+    train_df = (
+        input_df.groupBy("store", "department_code", "cluster_code", "next_sunday")
+        .agg(F.sum(F.col("sales_quantity")).alias("sales_quantity"))
     )
-    # Normalize weights to ensure they sum to 1.0 per cluster
-    # (guards against rounding errors)
-    .withColumn(
-        "weight_sum",
-        F.sum("sku_weight").over(
-            Window.partitionBy("store", "department_code", "cluster_code")
+    return train_df
+
+
+def train_model(train_spark_df):
+    df_train = train_spark_df.toPandas()
+    for col in ["store", "department_code", "cluster_code"]:
+        df_train[col] = df_train[col].astype(str)
+
+    bf = BaselineForecast(df_train, model_name=MLFLOW_MODEL_NAME)
+    bf.fit()
+    if LOG_AND_REGISTER_MODEL:
+        bf.log_model()
+    return bf
+
+
+def write_cluster_forecast(bf: BaselineForecast):
+    df_forecast = bf.predict(h=FORECAST_HORIZON_WEEKS)
+    forecast_df = spark.createDataFrame(df_forecast)
+    forecast_df.write.mode(WRITE_MODE).saveAsTable(OUTPUT_TABLE_CLUSTER_FORECAST)
+    return forecast_df
+
+
+def build_sku_weights(actuals_df):
+    sku_sales = actuals_df.groupBy("store", "department_code", "cluster_code", "sku_code").agg(
+        F.sum("sales_quantity").alias("sku_total_sales")
+    )
+    cluster_totals = sku_sales.groupBy("store", "department_code", "cluster_code").agg(
+        F.sum("sku_total_sales").alias("cluster_total_sales")
+    )
+    weights = (
+        sku_sales.join(cluster_totals, on=["store", "department_code", "cluster_code"], how="left")
+        .withColumn(
+            "sku_weight",
+            F.when(F.col("cluster_total_sales") > 0, F.col("sku_total_sales") / F.col("cluster_total_sales")).otherwise(
+                F.lit(0.0)
+            ),
         )
+        .withColumn("weight_sum", F.sum("sku_weight").over(Window.partitionBy("store", "department_code", "cluster_code")))
+        .withColumn(
+            "sku_weight",
+            F.when(F.col("weight_sum") > 0, F.col("sku_weight") / F.col("weight_sum")).otherwise(F.lit(0.0)),
+        )
+        .select("store", "department_code", "cluster_code", "sku_code", "sku_weight")
     )
-    .withColumn(
-        "sku_weight",
-        F.when(F.col("weight_sum") > 0,
-            F.col("sku_weight") / F.col("weight_sum")
-        ).otherwise(F.lit(0.0))
+    return weights
+
+
+def write_sku_forecast(cluster_forecast_df, sku_weights_df):
+    base_fcst_df = cluster_forecast_df.select(
+        "store",
+        "department_code",
+        "cluster_code",
+        F.to_date(F.col("weekstartdate")).alias("next_sunday"),
+        "forecast_qty",
     )
-    .select("store", "department_code", "cluster_code", "sku_code", "sku_weight")
-)
 
-display(sku_weights)
-
-# COMMAND ----------
-
-(sku_weights.write
- .mode("overwrite")
- .saveAsTable("aurora_sku_weights_lookup_table")
-)
-
-# COMMAND ----------
-
-sku_forecast = (
-    base_fcst_df
-    .join(sku_weights, on=["store", "department_code", "cluster_code"], how="left")
-    .withColumn(
-        "sku_forecast_qty",
-        F.round(F.col("forecast_qty") * F.col("sku_weight"), 3)
+    sku_forecast_df = (
+        base_fcst_df.join(sku_weights_df, on=["store", "department_code", "cluster_code"], how="left")
+        .withColumn("sku_weight", F.coalesce(F.col("sku_weight"), F.lit(0.0)))
+        .withColumn("forecast_qty", F.round(F.col("forecast_qty") * F.col("sku_weight"), 3))
+        .select("store", "department_code", "cluster_code", "sku_code", "next_sunday", "forecast_qty")
     )
-)
 
-display(sku_forecast)
+    sku_forecast_df.write.mode(WRITE_MODE).saveAsTable(OUTPUT_TABLE_SKU_FORECAST)
+    return sku_forecast_df
 
-# COMMAND ----------
 
-print("Forecast date range:")
-sku_forecast.agg(
-    F.min("next_sunday").alias("min_date"),
-    F.max("next_sunday").alias("max_date"),
-    F.countDistinct("next_sunday").alias("distinct_weeks")
-).show()
+def main():
+    actuals_df = spark.table(INPUT_TABLE_SALES_ACTUALS)
 
-print("Null sku_forecast_qty rows:", sku_forecast.filter(F.col("sku_forecast_qty").isNull()).count())
+    train_df = prepare_training_data(actuals_df=actuals_df)
+    bf = train_model(train_spark_df=train_df)
+    cluster_forecast_df = write_cluster_forecast(bf=bf)
 
-# COMMAND ----------
+    if WRITE_SKU_WEIGHTS or WRITE_SKU_FORECAST:
+        sku_weights_df = build_sku_weights(actuals_df=actuals_df)
 
-display(
-    sku_forecast
-    .groupBy("store", "department_code", "cluster_code", "sku_code", "next_sunday")
-    .count()
-    .filter(F.col("count") > 1)
-)
+        if WRITE_SKU_WEIGHTS:
+            sku_weights_df.write.mode(WRITE_MODE).saveAsTable(OUTPUT_TABLE_SKU_WEIGHTS)
 
-# COMMAND ----------
+        if WRITE_SKU_FORECAST:
+            write_sku_forecast(cluster_forecast_df=cluster_forecast_df, sku_weights_df=sku_weights_df)
 
-final_df = sku_forecast.select(
-    "store",
-    "department_code",
-    "cluster_code",
-    "sku_code",
-    "next_sunday",
-    F.col("sku_forecast_qty").alias("forecast_qty")
-)
 
-final_df.write.mode("overwrite").saveAsTable("aurora.default.aurora_sku_forecast_march_2026_oct_2026")
-print("✅ Done")
-
-# COMMAND ----------
-
-import pyspark.sql.functions as F
-from pyspark.sql.types import *
-
-df_existing = spark.table("aurora.gold.baseline_fcst_2026_store_cluster_week_ml")
-
-display(df_existing)
-
-# COMMAND ----------
-
-df_existing.select(
-    F.min("weekstartdate"),
-    F.max("weekstartdate")
-).show()
+if __name__ == "__main__":
+    main()

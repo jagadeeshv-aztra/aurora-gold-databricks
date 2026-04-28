@@ -1,14 +1,35 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC
-# MAGIC - **aurora.gold.fact_supply_coverage** is formed using below tables: 
-# MAGIC
-# MAGIC - aurora.default.inventory_aware_input_df_2023_2026
-# MAGIC - aurora.gold.fact_forecast_performance
+# MAGIC <h3>Databricks tables used</h3>
+# MAGIC <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse; width:100%">
+# MAGIC   <thead>
+# MAGIC     <tr>
+# MAGIC       <th align="left">Table</th>
+# MAGIC       <th align="left">Role</th>
+# MAGIC       <th align="left">How it’s used</th>
+# MAGIC     </tr>
+# MAGIC   </thead>
+# MAGIC   <tbody>
+# MAGIC     <tr>
+# MAGIC       <td><code>aurora.default.inventory_aware_input_df_2023_2026</code></td>
+# MAGIC       <td>INPUT</td>
+# MAGIC       <td>Weekly inventory/sales series used to compute rolling demand statistics</td>
+# MAGIC     </tr>
+# MAGIC     <tr>
+# MAGIC       <td><code>aurora.gold.fact_forecast_performance</code></td>
+# MAGIC       <td>INPUT</td>
+# MAGIC       <td>(Read-only) used for date range checks / validation</td>
+# MAGIC     </tr>
+# MAGIC     <tr>
+# MAGIC       <td><code>aurora.gold.fact_supply_coverage</code></td>
+# MAGIC       <td>OUTPUT</td>
+# MAGIC       <td>Coverage metrics by SKU x Location x Week</td>
+# MAGIC     </tr>
+# MAGIC   </tbody>
+# MAGIC </table>
 
 # COMMAND ----------
 
-import pandas as pd
 import pyspark.sql.functions as F
 from pyspark.sql.types import *
 from pyspark.sql.window import Window
@@ -16,151 +37,96 @@ import math
 
 # COMMAND ----------
 
-inventory_df = spark.table("aurora.default.inventory_aware_weekly_df")
+INPUT_TABLE_INVENTORY = "aurora.default.inventory_aware_input_df_2023_2026"
+INPUT_TABLE_FACT_FORECAST_PERFORMANCE = "aurora.gold.fact_forecast_performance"
+OUTPUT_TABLE_FACT_SUPPLY_COVERAGE = "aurora.gold.fact_supply_coverage"
 
-display(inventory_df)
+# Important variables / knobs
+LEAD_TIME_DAYS = 20
+REVIEW_PERIOD_DAYS = 7
+SERVICE_LEVEL = 0.95
+SERVICE_LEVEL_Z = 1.65  # z-score for ~95%
 
-# COMMAND ----------
-
-inventory_df = spark.table("aurora.default.inventory_aware_input_df_2023_2026")
-
-display(inventory_df)
-
-# COMMAND ----------
-
-df = spark.table("aurora.gold.fact_forecast_performance")
-
-df.select(
-    F.min("forecast_target_date"),
-    F.max("forecast_target_date")
-).distinct().show()
-
-# display(df.select("forecast_target_date").distinct())
+WRITE_MODE = "append"  # append as new computation dates are produced
+WRITE_FORMAT = "delta"
 
 # COMMAND ----------
 
-display(df.filter(F.col("forecast_target_date") >= '2025-12-07').orderBy("forecast_target_date"))
+def build_fact_supply_coverage(
+    inventory_df,
+    lead_time_days: int,
+    review_period_days: int,
+    service_level: float,
+    z_score: float,
+):
+    lead_time_weeks = lead_time_days / 7
+    review_weeks = review_period_days / 7
+    window_weeks = int(lead_time_weeks + review_weeks)
 
-# COMMAND ----------
+    inventory_df = inventory_df.withColumnRenamed("date", "week_start_date")
 
-inventory_df.select(
-    F.min("date"),
-    F.max("date")
-).show()
+    window_spec = (
+        Window.partitionBy("sku_code", "store")
+        .orderBy("week_start_date")
+        .rowsBetween(-window_weeks, -1)
+    )
 
-# COMMAND ----------
-
-# -----------------------------
-# 1️⃣ Parameters
-# -----------------------------
-lead_time_days = 20
-review_period_days = 7
-service_level = 0.95
-
-# Z-score for service level (95%) -- service level factor 
-Z = 1.65
-
-lead_time_weeks = lead_time_days / 7
-review_weeks = review_period_days / 7
-window_weeks = int(lead_time_weeks + review_weeks)
-
-# -----------------------------
-# 2️⃣ Prepare Base Dataset
-# -----------------------------
-
-inventory_df = inventory_df.withColumnRenamed("date", "week_start_date")
-
-# -----------------------------
-# 3️⃣ Rolling Window Calculation
-# -----------------------------
-
-window_spec = (
-    Window.partitionBy("sku_code", "store")
-    .orderBy("week_start_date")
-    .rowsBetween(-window_weeks, -1)  # previous N weeks
-)
-
-inventory_df = inventory_df \
-    .withColumn(
-        "mean_weekly_demand",
-        F.avg("sales_quantity").over(window_spec)
-    ) \
-    .withColumn(
+    inventory_df = inventory_df.withColumn("mean_weekly_demand", F.avg("sales_quantity").over(window_spec))
+    inventory_df = inventory_df.withColumn(
         "weekly_std_dev",
-        F.stddev("sales_quantity").over(window_spec)
+        F.when(
+            F.count("sales_quantity").over(window_spec) > 1,
+            F.stddev("sales_quantity").over(window_spec),
+        ).otherwise(0),
     )
 
-inventory_df = inventory_df.withColumn(
-    "weekly_std_dev",
-    F.when(
-        F.count("sales_quantity").over(window_spec) > 1,
-        F.stddev("sales_quantity").over(window_spec)
-    ).otherwise(0)
-)
-
-# -----------------------------
-# 4️⃣ Compute Lead Time Demand
-# -----------------------------
-
-inventory_df = inventory_df \
-    .withColumn(
+    inventory_df = inventory_df.withColumn(
         "window_demand",
-        F.col("mean_weekly_demand") * (lead_time_weeks + review_weeks)
-    ) \
-    .withColumn(
+        F.col("mean_weekly_demand") * (lead_time_weeks + review_weeks),
+    ).withColumn(
         "window_std_dev",
-        F.col("weekly_std_dev") * F.lit(math.sqrt(lead_time_weeks))
+        F.col("weekly_std_dev") * F.lit(math.sqrt(lead_time_weeks)),
     )
 
-# -----------------------------
-# 5️⃣ Safety Stock
-# -----------------------------
+    inventory_df = inventory_df.withColumn("safety_stock", F.lit(z_score) * F.col("window_std_dev"))
+    inventory_df = inventory_df.withColumn("required_coverage", F.col("window_demand") + F.col("safety_stock"))
 
-inventory_df = inventory_df.withColumn(
-    "safety_stock",
-    F.lit(Z) * F.col("window_std_dev")
-)
-
-# -----------------------------
-# 6️⃣ Required Coverage
-# -----------------------------
-
-inventory_df = inventory_df.withColumn(
-    "required_coverage",
-    F.col("window_demand") + F.col("safety_stock")
-)
-
-# -----------------------------
-# 7️⃣ Build fact_supply_coverage
-# -----------------------------
-
-fact_supply_coverage = inventory_df.select(
-    F.col("sku_code").alias("sku_id").cast(StringType()),
-    F.col("store").alias("location_id").cast(StringType()),
-    F.col("week_start_date").alias("computation_date"),
-    F.lit(lead_time_days).alias("lead_time_days"),
-    F.lit(review_period_days).alias("review_period_days"),
-    F.lit(service_level).cast("decimal(5,2)").alias("service_level"),
-    F.col("window_demand").cast("decimal(18,4)"),
-    F.col("window_std_dev").cast("decimal(18,6)"),
-    F.col("safety_stock").cast("decimal(18,4)"),
-    F.col("required_coverage").cast("decimal(18,4)")
-)
+    return inventory_df.select(
+        F.col("sku_code").alias("sku_id").cast(StringType()),
+        F.col("store").alias("location_id").cast(StringType()),
+        F.col("week_start_date").alias("computation_date"),
+        F.lit(lead_time_days).alias("lead_time_days"),
+        F.lit(review_period_days).alias("review_period_days"),
+        F.lit(service_level).cast("decimal(5,2)").alias("service_level"),
+        F.col("window_demand").cast("decimal(18,4)").alias("window_demand"),
+        F.col("window_std_dev").cast("decimal(18,6)").alias("window_std_dev"),
+        F.col("safety_stock").cast("decimal(18,4)").alias("safety_stock"),
+        F.col("required_coverage").cast("decimal(18,4)").alias("required_coverage"),
+    )
 
 # COMMAND ----------
 
-display(fact_supply_coverage)
+def main():
+    # Optional validation read (kept job-safe if table absent)
+    try:
+        _ = spark.table(INPUT_TABLE_FACT_FORECAST_PERFORMANCE).select(
+            F.min("forecast_target_date").alias("min_forecast_target_date"),
+            F.max("forecast_target_date").alias("max_forecast_target_date"),
+        )
+    except Exception:
+        pass
 
-# COMMAND ----------
+    inventory_df = spark.table(INPUT_TABLE_INVENTORY)
+    fact_supply_coverage = build_fact_supply_coverage(
+        inventory_df=inventory_df,
+        lead_time_days=LEAD_TIME_DAYS,
+        review_period_days=REVIEW_PERIOD_DAYS,
+        service_level=SERVICE_LEVEL,
+        z_score=SERVICE_LEVEL_Z,
+    )
 
-fact_supply_coverage.select(
-    F.min("computation_date"),
-    F.max("computation_date")
-).show()
+    fact_supply_coverage.write.format(WRITE_FORMAT).mode(WRITE_MODE).saveAsTable(OUTPUT_TABLE_FACT_SUPPLY_COVERAGE)
 
-# COMMAND ----------
 
-(fact_supply_coverage.write
-.mode("append")
-.saveAsTable("aurora.gold.fact_supply_coverage")
-)
+if __name__ == "__main__":
+    main()

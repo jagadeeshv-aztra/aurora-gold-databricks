@@ -1,8 +1,30 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC
-# MAGIC - **aurora.gold.dim_forecast_model** is formed using hardcoded manual inserts
-# MAGIC
+# MAGIC <h3>Databricks tables used</h3>
+# MAGIC <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse; width:100%">
+# MAGIC   <thead>
+# MAGIC     <tr>
+# MAGIC       <th align="left">Table</th>
+# MAGIC       <th align="left">Role</th>
+# MAGIC       <th align="left">How it’s used</th>
+# MAGIC     </tr>
+# MAGIC   </thead>
+# MAGIC   <tbody>
+# MAGIC     <tr>
+# MAGIC       <td><code>aurora.gold.dim_forecast_model</code></td>
+# MAGIC       <td>OUTPUT</td>
+# MAGIC       <td>Forecast model dimension populated with a fixed seed set</td>
+# MAGIC     </tr>
+# MAGIC   </tbody>
+# MAGIC </table>
+
+# COMMAND ----------
+
+OUTPUT_TABLE_DIM_FORECAST_MODEL = "aurora.gold.dim_forecast_model"
+
+# If this notebook is run as a Databricks Job, keep writes deterministic/idempotent.
+WRITE_MODE = "overwrite"  # "overwrite" for full refresh dimension
+WRITE_FORMAT = "delta"
 
 # COMMAND ----------
 
@@ -65,19 +87,12 @@ display(dim_forecast_model)
 # COMMAND ----------
 
 (dim_forecast_model.write
- .format("delta")
- .mode("overwrite")
- .saveAsTable("aurora.gold.dim_forecast_model")
+ .format(WRITE_FORMAT)
+ .mode(WRITE_MODE)
+ .saveAsTable(OUTPUT_TABLE_DIM_FORECAST_MODEL)
 )
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC INSERT INTO aurora.gold.dim_forecast_model (model_version, model_type, training_start_date, training_end_date, created_at)
-# MAGIC VALUES (
-# MAGIC   'AUTO_ARIMA_BASE_V01',
-# MAGIC   'Baseline',
-# MAGIC   current_timestamp(),
-# MAGIC   timestampadd(MINUTE, 20, current_timestamp()),
-# MAGIC   current_timestamp()
-# MAGIC )
+# MAGIC %md
+# MAGIC **Note:** the old `%sql INSERT` cell was removed to keep this job idempotent (no duplicate inserts). Use the seed DataFrame above as the single source of truth.

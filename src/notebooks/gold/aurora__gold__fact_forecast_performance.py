@@ -1,361 +1,215 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC - **aurora.gold.fact_forecast_performance** is formed using below tables: [_**finalized logic is unclear**_] 
-# MAGIC - aurora.default.baseline_fcst_2025_dec_2026_march
-# MAGIC - aurora.gold.dim_sku
-# MAGIC - aurora.silver.synthetic_sales_actuals_2023_2026
-# MAGIC - aurora.default.rolling_forecast_march_april_df
+# MAGIC <h3>Databricks tables used</h3>
+# MAGIC <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse; width:100%">
+# MAGIC   <thead>
+# MAGIC     <tr>
+# MAGIC       <th align="left">Table</th>
+# MAGIC       <th align="left">Role</th>
+# MAGIC       <th align="left">How it’s used</th>
+# MAGIC     </tr>
+# MAGIC   </thead>
+# MAGIC   <tbody>
+# MAGIC     <tr>
+# MAGIC       <td><code>aurora.default.rolling_forecast_march_april_df</code></td>
+# MAGIC       <td>INPUT</td>
+# MAGIC       <td>Primary source mode: provides sku/store weekly actuals + forecasts</td>
+# MAGIC     </tr>
+# MAGIC     <tr>
+# MAGIC       <td><code>aurora.default.baseline_fcst_2025_dec_2026_march</code></td>
+# MAGIC       <td>INPUT</td>
+# MAGIC       <td>Optional source mode: cluster-level forecasts</td>
+# MAGIC     </tr>
+# MAGIC     <tr>
+# MAGIC       <td><code>aurora.gold.fact_demand_history</code></td>
+# MAGIC       <td>INPUT</td>
+# MAGIC       <td>Optional source mode: provides SKU actuals</td>
+# MAGIC     </tr>
+# MAGIC     <tr>
+# MAGIC       <td><code>aurora.gold.dim_sku</code></td>
+# MAGIC       <td>INPUT</td>
+# MAGIC       <td>Optional source mode: maps SKU to department/cluster for weighting</td>
+# MAGIC     </tr>
+# MAGIC     <tr>
+# MAGIC       <td><code>aurora.silver.synthetic_sales_actuals_2023_2026</code></td>
+# MAGIC       <td>INPUT</td>
+# MAGIC       <td>Optional: seed rows when forecasts are unavailable</td>
+# MAGIC     </tr>
+# MAGIC     <tr>
+# MAGIC       <td><code>aurora.gold.fact_forecast_performance</code></td>
+# MAGIC       <td>OUTPUT</td>
+# MAGIC       <td>Gold forecast performance fact</td>
+# MAGIC     </tr>
+# MAGIC   </tbody>
+# MAGIC </table>
 
 # COMMAND ----------
 
-import pandas as pd
 import pyspark.sql.functions as F
 from pyspark.sql.types import *
 from pyspark.sql.window import Window
 
 # COMMAND ----------
 
-cluster_forecast_df = spark.table("aurora.default.baseline_fcst_2025_dec_2026_march").select(
-    F.col("store"),
-    F.col("department_code"),
-    F.col("cluster_code"),
-    F.col("weekstartdate").alias("next_sunday"),
-    F.col("forecast_qty")
-)
+INPUT_TABLE_ROLLING_FORECAST = "aurora.default.rolling_forecast_march_april_df"
+INPUT_TABLE_CLUSTER_FORECAST = "aurora.default.baseline_fcst_2025_dec_2026_march"
+INPUT_TABLE_FACT_DEMAND_HISTORY = "aurora.gold.fact_demand_history"
+INPUT_TABLE_DIM_SKU = "aurora.gold.dim_sku"
+INPUT_TABLE_SYNTHETIC_ACTUALS = "aurora.silver.synthetic_sales_actuals_2023_2026"
+OUTPUT_TABLE_FACT_FORECAST_PERFORMANCE = "aurora.gold.fact_forecast_performance"
 
-cluster_forecast_df = cluster_forecast_df.withColumn("next_sunday", F.to_date(F.col("next_sunday")))
+# Choose a single, explicit source mode for Jobs.
+# - "rolling_forecast": uses INPUT_TABLE_ROLLING_FORECAST (recommended for this repo as it already has actual_qty/forecast_qty)
+# - "cluster_forecast": derives sku forecasts from cluster forecasts + recent-sales weights
+# - "synthetic_seed": seeds actuals with null forecasts
+SOURCE_MODE = "rolling_forecast"
 
-display(cluster_forecast_df)
+# Important variables / knobs
+WEIGHT_ANCHOR_DATE = "2026-03-15"
+WEIGHT_LOOKBACK_DAYS = 56
+MAX_FORECAST_TARGET_DATE_EXCLUSIVE = None  # e.g. "2026-03-22" or None
+
+WRITE_MODE = "append"  # append new runs by default
+WRITE_FORMAT = "delta"
 
 # COMMAND ----------
 
-fact_df = spark.table("aurora.gold.fact_demand_history")
+def _apply_target_date_filter(df):
+    if MAX_FORECAST_TARGET_DATE_EXCLUSIVE is None:
+        return df
+    return df.filter(F.col("forecast_target_date") < F.lit(MAX_FORECAST_TARGET_DATE_EXCLUSIVE))
 
-display(fact_df)
 
-# COMMAND ----------
+def build_from_rolling_forecast(df):
+    df = df.drop("department_code", "cluster_code")
+    df = df.withColumnsRenamed(
+        {
+            "sku_code": "sku_id",
+            "store": "location_id",
+            "next_sunday": "forecast_target_date",
+            "actual_qty": "actual_units",
+            "forecast_qty": "forecast_units",
+        }
+    )
 
-weekly_actuals = (
-    fact_df
-    .withColumn(
+    df = (
+        df.withColumn("forecast_creation_date", F.current_date())
+        .withColumn("sku_id", F.col("sku_id").cast("string"))
+        .withColumn("location_id", F.col("location_id").cast("string"))
+        .withColumn("forecast_target_date", F.to_date("forecast_target_date"))
+        .withColumn("actual_units", F.col("actual_units").cast("int"))
+        .withColumn("forecast_units", F.col("forecast_units").cast(DecimalType(14, 2)))
+    )
+
+    df = _apply_target_date_filter(df)
+    return df.select(
+        "sku_id",
+        "location_id",
+        "forecast_creation_date",
         "forecast_target_date",
-        F.date_sub(F.col("next_sunday"), F.dayofweek("next_sunday") - F.lit(1))
+        "actual_units",
+        "forecast_units",
     )
-    .groupBy("sku_id", "location_id", "forecast_target_date")
-    .agg(
-        F.sum("units_sold").alias("actual_units")
-    )
-)
 
-display(weekly_actuals)
 
-# COMMAND ----------
-
-dim_sku = spark.table("aurora.gold.dim_sku")
-
-dim_sku = dim_sku.withColumn(
-    "category",
-    F.split(F.col("category"), ":")[0]
-).withColumn(
-    "subcategory",
-    F.split(F.col("subcategory"), "_")[0]
-)
-
-display(dim_sku)
-
-# COMMAND ----------
-
-sales_enriched = (
-    fact_df
-    .join(
-        dim_sku.select(
-            "sku_id",
-            F.col("category").alias("department_code"),
-            F.col("subcategory").alias("cluster_code")),
-        on="sku_id",
-        how="left"
-    )
-)
-
-display(sales_enriched)
-
-# COMMAND ----------
-
-weight_anchor = "2026-03-15"
-
-recent_sales = sales_enriched.filter(
-    (F.col("next_sunday") >= F.date_sub(F.lit(weight_anchor), 56)) &
-    (F.col("next_sunday") <= F.lit(weight_anchor))
-)
-
-sku_cluster_sales = (
-    recent_sales
-    .groupBy("location_id", "department_code", "cluster_code", "sku_id")
-    .agg(F.sum("units_sold").alias("sku_sales"))
-)
-
-cluster_sales = (
-    sku_cluster_sales
-    .groupBy("location_id", "department_code", "cluster_code")
-    .agg(F.sum("sku_sales").alias("cluster_sales"))
-)
-
-weights = (
-    sku_cluster_sales
-    .join(
-        cluster_sales,
-        ["location_id", "department_code", "cluster_code"]
-    )
-    .withColumn(
-        "weight",
-        F.when(F.col("cluster_sales") != 0,
-               F.col("sku_sales") / F.col("cluster_sales"))
-         .otherwise(0)
-    )
-)
-
-# COMMAND ----------
-
-display(weights)
-
-# COMMAND ----------
-
-cluster_forecast_df = cluster_forecast_df.withColumnRenamed("store", "location_id")
-
-sku_forecast = (
-    cluster_forecast_df
-    .join(
-        weights,
-        ["location_id", "department_code", "cluster_code"],
-        "left"
-    )
-)
-
-sku_forecast = (
-    sku_forecast
-    .withColumn("weight", F.coalesce("weight", F.lit(0)))
-    .withColumn("sku_forecast_qty", F.col("forecast_qty") * F.col("weight"))
-)
-
-# COMMAND ----------
-
-display(sku_forecast.groupBy(
-    "location_id","department_code","cluster_code","next_sunday"
-).agg(
-    F.round(F.sum("sku_forecast_qty"), 2).alias("sum_sku_forecast")
-))
-
-# COMMAND ----------
-
-display(cluster_forecast_df)
-
-# display(cluster_forecast_df.groupBy(
-#     "location_id","department_code","cluster_code","next_sunday"
-# ).agg(
-#     F.sum("forecast_qty").alias("sum_cluster_forecast")
-# ))
-
-# COMMAND ----------
-
-sku_actuals = weekly_actuals.select(
-    "sku_id",
-    "location_id",
-    F.col("forecast_target_date").alias("next_sunday"),
-    "actual_units"
-)
-
-sku_perf = (
-    sku_forecast
-    .join(
-        sku_actuals,
-        on=["sku_id", "location_id", "next_sunday"],
-        how="left"
-    )
-    .fillna(0)
-)
-
-# COMMAND ----------
-
-weekly_actuals.filter(F.col("forecast_target_date") == "2025-07-13").show()
-
-# COMMAND ----------
-
-sku_forecast.select("next_sunday").distinct().orderBy("next_sunday").show()
-weekly_actuals.select("forecast_target_date").distinct().orderBy(F.col("forecast_target_date").desc()).show()
-
-# COMMAND ----------
-
-display(sku_perf)
-
-# COMMAND ----------
-
-fact_forecast_performance_df = sku_perf.select(
-    "sku_id",
-    "location_id",
-    F.current_date().alias("forecast_creation_date"),
-    F.col("next_sunday").alias("forecast_target_date"),
-    "actual_units",
-    F.col("sku_forecast_qty").alias("forecast_units").cast(DecimalType(14, 2))
-)
-
-fact_forecast_performance = fact_forecast_performance_df.filter(F.col("forecast_target_date") < '2026-03-22') 
-
-display(fact_forecast_performance)
-
-# COMMAND ----------
-
-fact_df = (
-    spark
-    .table("aurora.silver.synthetic_sales_actuals_2023_2026")
-    .filter(F.col("next_sunday") > "2025-09-28")
-    .select(
+def build_from_synthetic_actuals(df):
+    df = df.select(
         F.col("sku_code").alias("sku_id"),
         F.col("store").alias("location_id"),
         F.current_date().alias("forecast_creation_date"),
         F.col("next_sunday").alias("forecast_target_date"),
         F.col("weekly_sales_qty").alias("actual_units").cast("int"),
-        F.lit(None).alias("forecast_units").cast(DecimalType(14, 2))
+        F.lit(None).alias("forecast_units").cast(DecimalType(14, 2)),
     )
-)
-
-display(fact_df)
-print(fact_df.count())
-
-# COMMAND ----------
-
-display(fact_df.groupBy("sku_id", "location_id", "forecast_target_date").count())
-
-# COMMAND ----------
-
-fact_df.select(
-    F.min("forecast_target_date"),
-    F.max("forecast_target_date")
-).show()
-
-# COMMAND ----------
-
-display(fact_forecast_performance.filter(F.col("location_id") == "10424"))
-
-# COMMAND ----------
-
-fact_forecast_performance = (
-    fact_forecast_performance
-    .withColumn("sku_id", F.coalesce(F.col("sku_id"), F.lit("NA")))
-    .withColumn("forecast_units", F.coalesce(F.col("forecast_units"), F.lit(0)))
-)
-
-# COMMAND ----------
-
-fact_forecast_performance_df = spark.table("aurora.gold.fact_forecast_performance")
-
-display(fact_forecast_performance_df)
-
-# COMMAND ----------
+    df = _apply_target_date_filter(df)
+    return df
 
 
-    
+def build_from_cluster_forecast(cluster_forecast_df, fact_demand_history_df, dim_sku_df):
+    cluster_forecast_df = cluster_forecast_df.select(
+        F.col("store").alias("location_id").cast("string"),
+        F.col("department_code").cast("string"),
+        F.col("cluster_code").cast("string"),
+        F.to_date(F.col("weekstartdate")).alias("forecast_target_date"),
+        F.col("forecast_qty").alias("cluster_forecast_units"),
+    )
 
-display(fact_df)
+    weekly_actuals = (
+        fact_demand_history_df.groupBy("sku_id", "location_id", F.col("demand_date").alias("forecast_target_date"))
+        .agg(F.sum("units_sold").alias("actual_units"))
+        .withColumn("sku_id", F.col("sku_id").cast("string"))
+        .withColumn("location_id", F.col("location_id").cast("string"))
+        .withColumn("forecast_target_date", F.to_date("forecast_target_date"))
+    )
 
-# COMMAND ----------
+    dim_sku_df = dim_sku_df.withColumn("department_code", F.split(F.col("category"), ":")[0]).withColumn(
+        "cluster_code", F.split(F.col("subcategory"), "_")[0]
+    )
 
-(fact_df.write
- .mode("overwrite")
- .saveAsTable("aurora.gold.fact_forecast_performance")
-)
+    sales_enriched = fact_demand_history_df.join(
+        dim_sku_df.select("sku_id", "department_code", "cluster_code"),
+        on="sku_id",
+        how="left",
+    ).select("sku_id", "location_id", "demand_date", "units_sold", "department_code", "cluster_code")
 
-# COMMAND ----------
+    recent_sales = sales_enriched.filter(
+        (F.col("demand_date") >= F.date_sub(F.lit(WEIGHT_ANCHOR_DATE), WEIGHT_LOOKBACK_DAYS))
+        & (F.col("demand_date") <= F.lit(WEIGHT_ANCHOR_DATE))
+    )
 
-fact_forecast_performance = fact_forecast_performance \
-    .withColumn(
+    sku_cluster_sales = recent_sales.groupBy("location_id", "department_code", "cluster_code", "sku_id").agg(
+        F.sum("units_sold").alias("sku_sales")
+    )
+    cluster_sales = sku_cluster_sales.groupBy("location_id", "department_code", "cluster_code").agg(
+        F.sum("sku_sales").alias("cluster_sales")
+    )
+    weights = (
+        sku_cluster_sales.join(cluster_sales, ["location_id", "department_code", "cluster_code"])
+        .withColumn("weight", F.when(F.col("cluster_sales") != 0, F.col("sku_sales") / F.col("cluster_sales")).otherwise(0))
+        .select("location_id", "department_code", "cluster_code", "sku_id", "weight")
+    )
+
+    sku_forecast = (
+        cluster_forecast_df.join(weights, ["location_id", "department_code", "cluster_code"], "left")
+        .withColumn("weight", F.coalesce("weight", F.lit(0.0)))
+        .withColumn("forecast_units", (F.col("cluster_forecast_units") * F.col("weight")).cast(DecimalType(14, 2)))
+        .select("sku_id", "location_id", "forecast_target_date", "forecast_units")
+    )
+
+    perf = (
+        sku_forecast.join(weekly_actuals, on=["sku_id", "location_id", "forecast_target_date"], how="left")
+        .withColumn("actual_units", F.coalesce(F.col("actual_units"), F.lit(0)).cast("int"))
+        .withColumn("forecast_creation_date", F.current_date())
+    )
+
+    perf = _apply_target_date_filter(perf)
+    return perf.select(
+        "sku_id",
+        "location_id",
+        "forecast_creation_date",
+        "forecast_target_date",
         "actual_units",
-        (F.col("actual_units")).cast(IntegerType())
-    ) \
-    .withColumn(
-        "forecast_error",
-        (F.col("actual_units") - F.col("forecast_units")).cast(DecimalType(14, 4))
-    ) \
-    .withColumn(
-        "absolute_error",
-        (F.abs("forecast_error")).cast(DecimalType(14, 4))
-    ) \
-    .withColumn(
-        "squared_error",
-        (F.pow("forecast_error", 2)).cast(DecimalType(18, 6))
-    ) \
-    .withColumn(
-        "pct_error",
-        F.when(
-            F.col("actual_units") != 0,
-            (F.col("forecast_error") / F.col("actual_units")) * 100
-        ).otherwise(F.lit(None)).cast(DecimalType(12, 6))
-    ) \
-    .withColumn(
-        "bias_pct",
-        F.when(
-            F.col("actual_units") != 0,
-            ((F.col("forecast_units") - F.col("actual_units")) / F.col("actual_units")) * 100            
-        ).otherwise(F.lit(None)).cast(DecimalType(5, 2))
-    ) \
-    .withColumn(
-        "confidence_pct", 
-        F.when(
-            F.col("actual_units") != 0,
-            F.greatest(
-                F.lit(0),
-                1 - F.abs(F.col("forecast_error") / F.col("actual_units"))) * 100
-        ).otherwise(F.lit(None)).cast(DecimalType(5, 2))
+        "forecast_units",
     )
 
-display(fact_forecast_performance)
 
-# COMMAND ----------
+def main():
+    if SOURCE_MODE == "rolling_forecast":
+        df = spark.table(INPUT_TABLE_ROLLING_FORECAST)
+        out_df = build_from_rolling_forecast(df)
+    elif SOURCE_MODE == "cluster_forecast":
+        cluster_df = spark.table(INPUT_TABLE_CLUSTER_FORECAST)
+        fact_df = spark.table(INPUT_TABLE_FACT_DEMAND_HISTORY)
+        dim_sku_df = spark.table(INPUT_TABLE_DIM_SKU)
+        out_df = build_from_cluster_forecast(cluster_df, fact_df, dim_sku_df)
+    elif SOURCE_MODE == "synthetic_seed":
+        df = spark.table(INPUT_TABLE_SYNTHETIC_ACTUALS)
+        out_df = build_from_synthetic_actuals(df)
+    else:
+        raise ValueError(f"Unsupported SOURCE_MODE: {SOURCE_MODE}")
 
-# MAGIC %md
-# MAGIC
+    out_df.write.format(WRITE_FORMAT).mode(WRITE_MODE).saveAsTable(OUTPUT_TABLE_FACT_FORECAST_PERFORMANCE)
 
-# COMMAND ----------
 
-import pyspark.sql.functions as F
-from pyspark.sql.types import *
-
-df = spark.table("aurora.default.rolling_forecast_march_april_df").drop("department_code", "cluster_code")
-
-fcst_performance_df = df.withColumnsRenamed({
-    "sku_code": "sku_id",
-    "store": "location_id",
-    "next_sunday": "forecast_target_date",
-    "actual_qty": "actual_units",
-    "forecast_qty": "forecast_units",
-})
-
-fcst_performance_df = (
-    fcst_performance_df
-    .withColumn("forecast_creation_date", F.current_date())
-    .withColumn("forecast_units", F.col("forecast_units").cast(DecimalType(14, 2)))
-)
-
-display(fcst_performance_df)
-
-# COMMAND ----------
-
-fact_df = spark.table("aurora.gold.fact_forecast_performance")
-
-display(fact_df)
-
-# COMMAND ----------
-
-import pyspark.sql.functions as F
-from pyspark.sql.types import *
-
-fact_df.select(
-    F.min("forecast_target_date"),
-    F.max("forecast_target_date")
-).show()
-
-# COMMAND ----------
-
-(fcst_performance_df.write
- .mode("append")
- .saveAsTable("aurora.gold.fact_forecast_performance")
-)
+if __name__ == "__main__":
+    main()
